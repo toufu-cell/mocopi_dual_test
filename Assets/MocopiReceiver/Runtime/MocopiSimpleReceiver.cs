@@ -199,6 +199,65 @@ namespace Mocopi.Receiver
         {
             AvatarSettings.Add(new MocopiSimpleReceiverAvatarSettings(mocopiAvatar, port));
         }
+
+        
+        /// <summary>
+        /// 全てのアバターの位置キャリブレーションを実行
+        /// </summary>
+        public void CalibrateAllAvatarsPosition()
+        {
+            for (int i = 0; i < AvatarSettings.Count; i++)
+            {
+                if (AvatarSettings[i].MocopiAvatar != null)
+                {
+                    AvatarSettings[i].MocopiAvatar.CalibratePosition();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 指定されたインデックスのアバターの位置キャリブレーションを実行
+        /// </summary>
+        /// <param name="avatarIndex">アバターのインデックス</param>
+        public void CalibrateAvatarPosition(int avatarIndex)
+        {
+            if (avatarIndex >= 0 && avatarIndex < AvatarSettings.Count && AvatarSettings[avatarIndex].MocopiAvatar != null)
+            {
+                AvatarSettings[avatarIndex].MocopiAvatar.CalibratePosition();
+            }
+            else
+            {
+                Debug.LogError($"MocopiSimpleReceiver: 無効なアバターインデックス: {avatarIndex}");
+            }
+        }
+
+        /// <summary>
+        /// 全てのアバターの位置キャリブレーションをリセット
+        /// </summary>
+        public void ResetAllAvatarsPositionCalibration()
+        {
+            for (int i = 0; i < AvatarSettings.Count; i++)
+            {
+                if (AvatarSettings[i].MocopiAvatar != null)
+                {
+                    AvatarSettings[i].MocopiAvatar.ResetPositionCalibration();
+                }
+            }
+        }
+
+        /// <summary>
+        /// 指定されたアバターのキャリブレーション状態を取得
+        /// </summary>
+        /// <param name="avatarIndex">アバターのインデックス</param>
+        /// <returns>キャリブレーション済みかどうか</returns>
+        public bool IsAvatarPositionCalibrated(int avatarIndex)
+        {
+            if (avatarIndex >= 0 && avatarIndex < AvatarSettings.Count && AvatarSettings[avatarIndex].MocopiAvatar != null)
+            {
+                return AvatarSettings[avatarIndex].MocopiAvatar.IsPositionCalibrated;
+            }
+            return false;
+        }
         #endregion --Methods--
 
         #region --Classes--
