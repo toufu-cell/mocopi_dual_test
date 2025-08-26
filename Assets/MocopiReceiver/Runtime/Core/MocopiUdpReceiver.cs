@@ -265,13 +265,15 @@ namespace Mocopi.Receiver.Core
                         }
                     }
                 }
-                catch (SocketException e)
+                catch (SocketException)
                 {
-                    Debug.Log($"[MocopiUdpReceiver] {e.Message} : {e.GetType()}");
+                    // メインスレッドでのログ出力のためコメントアウト
+                    // Debug.Log($"[MocopiUdpReceiver] {e.Message} : {e.GetType()}");
                 }
                 catch (System.Exception e)
                 {
-                    Debug.LogErrorFormat($"[MocopiUdpReceiver] Udp receive failed. {e.Message} : {e.GetType()}");
+                    // メインスレッドでのログ出力のためUnityMainThreadDispatcher使用またはコメントアウト
+                    // Debug.LogErrorFormat($"[MocopiUdpReceiver] Udp receive failed. {e.Message} : {e.GetType()}");
                     this.UdpStop();
                     this.OnUdpReceiveFailed?.Invoke(e);
                     break;

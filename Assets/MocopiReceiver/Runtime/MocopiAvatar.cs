@@ -90,12 +90,12 @@ namespace Mocopi.Receiver
         /// <summary>
         /// Enable motion buffering
         /// </summary>
-        public bool IsBufferingEnabled = true;
+        public bool IsBufferingEnabled = false;
 
         /// <summary>
         /// Buffer delay recovery ratio
         /// </summary>
-        [Range(0, 1f)] public float DelayRecoveryRate = 0.001f;
+        [Range(0, 1f)] public float DelayRecoveryRate = 1.0f;
 
         /// <summary>
         /// Remove AnimatorController on update or not
@@ -116,6 +116,34 @@ namespace Mocopi.Receiver
         /// Bones position
         /// </summary>
         private readonly Dictionary<MocopiBone, Vector3> bonePositions = new Dictionary<MocopiBone, Vector3>();
+        
+        // Position Calibration Fields
+        [Header("Position Calibration")]
+        [SerializeField] private bool enablePositionCalibration = true;
+        private Vector3 avatarInitialPosition = Vector3.zero;
+        private Quaternion avatarInitialRotation = Quaternion.identity;
+        private Vector3 avatarInitialScale = Vector3.one;
+        private Vector3 mocopiCalibrationPosition = Vector3.zero;
+        private bool isPositionCalibrated = false;
+        private bool hasReceivedFirstPosition = false;
+        
+        // Initial Bone State Storage for Pose Reset
+        private readonly Dictionary<MocopiBone, Vector3> initialBonePositions = new Dictionary<MocopiBone, Vector3>();
+        private readonly Dictionary<MocopiBone, Quaternion> initialBoneRotations = new Dictionary<MocopiBone, Quaternion>();
+        private HumanPose initialHumanPose = new HumanPose();
+        private bool hasStoredInitialPose = false;
+        // Motion Quality Filtering Fields
+        [Header("Motion Quality Filtering")]
+        [SerializeField] private bool enableQualityFilter = false;
+        [SerializeField] private float confidenceThreshold = 0.3f;
+        [SerializeField] private float smoothingFactor = 0.9f;
+        [SerializeField] private float maxReasonableVelocity = 3.0f; // m/s
+        [SerializeField] private float maxReasonableAngularVel = 360.0f; // degrees/s
+
+        private SkeletonData previousSkeletonData;
+        private bool hasPreviousSkeletonData = false;
+        private Dictionary<int, Vector3> previousBonePositions = new Dictionary<int, Vector3>();
+        private Dictionary<int, Quaternion> previousBoneRotations = new Dictionary<int, Quaternion>();
 
         /// <summary>
         /// bones rotation
@@ -369,6 +397,420 @@ namespace Mocopi.Receiver
         }
 
         /// <summary>
+        /// モーションデータの品質を評価する
+        /// </summary>
+        /// <param name="skeletonData">評価するスケルトンデータ</param>
+        /// <returns>0.0-1.0の品質スコア（1.0が最高品質）</returns>
+        private float EvaluateDataConfidence(SkeletonData skeletonData)
+        {
+            if (!enableQualityFilter || !hasPreviousSkeletonData)
+            {
+                return 1.0f; // 品質フィルタが無効、または前回データがない場合は最高品質とする
+            }
+
+            float positionScore = EvaluatePositionChange(skeletonData);
+            float rotationScore = EvaluateRotationChange(skeletonData);
+            
+            // 位置と回転の評価を組み合わせて最終スコアを計算
+            float confidence = (positionScore + rotationScore) * 0.5f;
+            
+            // デバッグ出力を追加（間引いて出力）
+            if (UnityEngine.Random.value < 0.05f) // 5%の確率で出力
+            {
+                Debug.Log($"MocopiAvatar Quality Debug: Position={positionScore:F3}, Rotation={rotationScore:F3}, Final={confidence:F3}, Threshold={confidenceThreshold:F3}");
+            }
+            
+            return Mathf.Clamp01(confidence);
+        }
+
+        /// <summary>
+        /// 位置変化の妥当性を評価する
+        /// </summary>
+        /// <param name="skeletonData">評価するスケルトンデータ</param>
+        /// <returns>0.0-1.0の評価スコア</returns>
+        private float EvaluatePositionChange(SkeletonData skeletonData)
+        {
+            float totalScore = 0.0f;
+            int validBoneCount = 0;
+            float maxVelocity = 0.0f;
+
+            for (int i = 0; i < skeletonData.BoneIds.Length; i++)
+            {
+                int boneId = skeletonData.BoneIds[i];
+                
+                if (!previousBonePositions.ContainsKey(boneId))
+                {
+                    // 初回フレームの場合は高評価を与える
+                    totalScore += 1.0f;
+                    validBoneCount++;
+                    continue;
+                }
+
+                Vector3 currentPosition = new Vector3(
+                    skeletonData.PositionsX[i],
+                    skeletonData.PositionsY[i],
+                    skeletonData.PositionsZ[i]
+                );
+
+                Vector3 previousPosition = previousBonePositions[boneId];
+                
+                // フレーム間の移動距離を計算
+                float distance = Vector3.Distance(currentPosition, previousPosition);
+                
+                // フレーム間隔を考慮した速度を計算（30FPS想定）
+                float deltaTime = 1.0f / SENSOR_FPS;
+                float velocity = distance / deltaTime;
+                
+                if (velocity > maxVelocity) maxVelocity = velocity;
+                
+                // 妥当な速度範囲内かチェック（より寛容な評価式に変更）
+                float velocityScore = Mathf.Exp(-velocity / (maxReasonableVelocity * 0.5f));
+                
+                totalScore += velocityScore;
+                validBoneCount++;
+            }
+
+            float finalScore = validBoneCount > 0 ? totalScore / validBoneCount : 1.0f;
+            
+            // デバッグ出力（頻繁すぎる場合は間引く）
+            if (validBoneCount > 0 && UnityEngine.Random.value < 0.1f) // 10%の確率で出力
+            {
+                Debug.Log($"Position Eval: ValidBones={validBoneCount}, MaxVel={maxVelocity:F3}m/s, MaxReasonable={maxReasonableVelocity:F1}m/s, Score={finalScore:F3}");
+            }
+
+            return finalScore;
+        }
+
+        /// <summary>
+        /// 回転変化の妥当性を評価する
+        /// </summary>
+        /// <param name="skeletonData">評価するスケルトンデータ</param>
+        /// <returns>0.0-1.0の評価スコア</returns>
+        private float EvaluateRotationChange(SkeletonData skeletonData)
+        {
+            float totalScore = 0.0f;
+            int validBoneCount = 0;
+            float maxAngularVelocity = 0.0f;
+
+            for (int i = 0; i < skeletonData.BoneIds.Length; i++)
+            {
+                int boneId = skeletonData.BoneIds[i];
+                
+                if (!previousBoneRotations.ContainsKey(boneId))
+                {
+                    // 初回フレームの場合は高評価を与える
+                    totalScore += 1.0f;
+                    validBoneCount++;
+                    continue;
+                }
+
+                Quaternion currentRotation = new Quaternion(
+                    skeletonData.RotationsX[i],
+                    skeletonData.RotationsY[i],
+                    skeletonData.RotationsZ[i],
+                    skeletonData.RotationsW[i]
+                );
+
+                Quaternion previousRotation = previousBoneRotations[boneId];
+                
+                // 回転角度の変化を計算
+                float angle = Quaternion.Angle(currentRotation, previousRotation);
+                
+                // フレーム間隔を考慮した角速度を計算（30FPS想定）
+                float deltaTime = 1.0f / SENSOR_FPS;
+                float angularVelocity = angle / deltaTime;
+                
+                if (angularVelocity > maxAngularVelocity) maxAngularVelocity = angularVelocity;
+                
+                // 妥当な角速度範囲内かチェック（より寛容な評価式に変更）
+                float angularScore = Mathf.Exp(-angularVelocity / (maxReasonableAngularVel * 0.5f));
+                
+                totalScore += angularScore;
+                validBoneCount++;
+            }
+
+            float finalScore = validBoneCount > 0 ? totalScore / validBoneCount : 1.0f;
+            
+            // デバッグ出力（頻繁すぎる場合は間引く）
+            if (validBoneCount > 0 && UnityEngine.Random.value < 0.1f) // 10%の確率で出力
+            {
+                Debug.Log($"Rotation Eval: ValidBones={validBoneCount}, MaxAngVel={maxAngularVelocity:F1}°/s, MaxReasonable={maxReasonableAngularVel:F1}°/s, Score={finalScore:F3}");
+            }
+
+            return finalScore;
+        }
+
+        /// <summary>
+        /// 前回のボーン位置・回転データを更新する
+        /// </summary>
+        /// <param name="skeletonData">更新するスケルトンデータ</param>
+        private void UpdatePreviousBoneData(SkeletonData skeletonData)
+        {
+            for (int i = 0; i < skeletonData.BoneIds.Length; i++)
+            {
+                int boneId = skeletonData.BoneIds[i];
+                
+                Vector3 position = new Vector3(
+                    skeletonData.PositionsX[i],
+                    skeletonData.PositionsY[i],
+                    skeletonData.PositionsZ[i]
+                );
+                
+                Quaternion rotation = new Quaternion(
+                    skeletonData.RotationsX[i],
+                    skeletonData.RotationsY[i],
+                    skeletonData.RotationsZ[i],
+                    skeletonData.RotationsW[i]
+                );
+
+                previousBonePositions[boneId] = position;
+                previousBoneRotations[boneId] = rotation;
+            }
+        }
+
+        /// <summary>
+        /// 品質に基づいてHumanPoseにスムージングを適用する
+        /// </summary>
+        /// <param name="targetPose">目標ポーズ</param>
+        /// <param name="confidence">データの品質（0.0-1.0）</param>
+        /// <returns>補正されたポーズ</returns>
+        private HumanPose ApplyQualityBasedSmoothing(ref HumanPose targetPose, float confidence)
+        {
+            if (!enableQualityFilter || !hasPreviousSkeletonData)
+            {
+                return targetPose; // 品質フィルタが無効または前回データがない場合はそのまま返す
+            }
+
+            // 品質が低いほど強いスムージングを適用
+            float dynamicSmoothingFactor = Mathf.Lerp(smoothingFactor, 0.1f, confidence);
+            
+            HumanPose smoothedPose = targetPose;
+            
+            // 前回のポーズが存在する場合のみスムージングを適用
+            if (smoothnesspose.bodyPosition != Vector3.zero || smoothnesspose.bodyRotation != Quaternion.identity)
+            {
+                // bodyPositionとbodyRotationのスムージング
+                smoothedPose.bodyPosition = Vector3.Lerp(smoothnesspose.bodyPosition, targetPose.bodyPosition, 1.0f - dynamicSmoothingFactor);
+                smoothedPose.bodyRotation = Quaternion.Lerp(smoothnesspose.bodyRotation, targetPose.bodyRotation, 1.0f - dynamicSmoothingFactor);
+                
+                // 筋肉値のスムージング
+                for (int i = 0; i < smoothedPose.muscles.Length && i < smoothnesspose.muscles.Length; i++)
+                {
+                    smoothedPose.muscles[i] = Mathf.Lerp(smoothnesspose.muscles[i], targetPose.muscles[i], 1.0f - dynamicSmoothingFactor);
+                }
+            }
+
+            return smoothedPose;
+        }
+
+        /// <summary>
+        /// 現在のフレームの品質スコアを取得する
+        /// </summary>
+        /// <returns>最後に評価された品質スコア</returns>
+        private float GetCurrentFrameConfidence()
+        {
+            if (!enableQualityFilter || !hasPreviousSkeletonData)
+            {
+                return 1.0f; // 品質フィルタが無効な場合は最高品質
+            }
+
+            // 現在のスケルトンデータの品質を再評価
+            return EvaluateDataConfidence(skeletonData);
+        }
+
+        /// <summary>
+        /// 品質フィルタのデバッグ情報をInspectorに表示するための更新
+        /// </summary>
+        [System.Serializable]
+        private class QualityFilterDebugInfo
+        {
+            [Header("品質フィルタ デバッグ情報")]
+            [SerializeField] public float currentConfidence = 1.0f;
+            [SerializeField] public int filteredFramesCount = 0;
+            [SerializeField] public float averageConfidence = 1.0f;
+            [SerializeField] public bool isFilterActive = false;
+        }
+
+        // [SerializeField] private QualityFilterDebugInfo debugInfo = new QualityFilterDebugInfo();
+        private int totalFramesProcessed = 0;
+        private float totalConfidenceSum = 0.0f;
+
+        /// <summary>
+        /// デバッグ情報を更新する
+        /// </summary>
+        /// <param name="confidence">現在のフレームの品質</param>
+        /// <param name="wasFiltered">フレームが破棄されたかどうか</param>
+        private void UpdateDebugInfo(float confidence, bool wasFiltered)
+        {
+            // 一時的に無効化
+            // if (!enableQualityFilter) return;
+
+            // debugInfo.currentConfidence = confidence;
+            // debugInfo.isFilterActive = enableQualityFilter;
+            
+            // if (wasFiltered)
+            // {
+            //     debugInfo.filteredFramesCount++;
+            // }
+            
+            // totalFramesProcessed++;
+            // totalConfidenceSum += confidence;
+            // debugInfo.averageConfidence = totalConfidenceSum / totalFramesProcessed;
+        }
+
+        
+        /// <summary>
+        /// 現在の位置を基準点としてキャリブレーションを実行し、アバターを初期ポーズにリセット
+        /// </summary>
+        /// <summary>
+        /// 現在の位置を基準点としてキャリブレーションを実行し、アバターを初期ポーズにリセット
+        /// </summary>
+        /// <summary>
+        /// 現在の位置を基準点としてキャリブレーションを実行し、アバターを初期ポーズにリセット
+        /// </summary>
+        public void CalibratePosition()
+        {
+            Debug.Log($"MocopiAvatar: キャリブレーション開始 - hasReceivedFirstPosition: {hasReceivedFirstPosition}, hasStoredInitialPose: {hasStoredInitialPose}");
+            
+            if (!hasReceivedFirstPosition)
+            {
+                Debug.LogWarning("MocopiAvatar: まだ位置データを受信していません。mocopiデバイスが接続され、データが送信されていることを確認してください。");
+                return;
+            }
+
+            if (!hasStoredInitialPose)
+            {
+                Debug.LogWarning("MocopiAvatar: 初期ポーズが保存されていません。スケルトンの初期化を待ってください。");
+                return;
+            }
+
+            // 現在のルートボーン位置を取得（キャリブレーション前の実際の位置）
+            MocopiBone rootBone = bones.Find(_ => _.ParentId < 0);
+            if (rootBone != null)
+            {
+                // ルートボーンから実際のmocopi位置を取得（現在の実際の位置データを使用）
+                Vector3 actualMocopiPosition = Vector3.zero;
+                
+                // 最新のスケルトンデータから直接位置を取得
+                for (int i = 0; i < skeletonData.BoneIds.Length; i++)
+                {
+                    if (skeletonData.BoneIds[i] == rootBone.Id)
+                    {
+                        actualMocopiPosition = ConvertPluginDataToVector3(
+                            skeletonData.PositionsX[i],
+                            skeletonData.PositionsY[i],
+                            skeletonData.PositionsZ[i]
+                        );
+                        break;
+                    }
+                }
+                
+                // キャリブレーション基準位置として記録
+                mocopiCalibrationPosition = actualMocopiPosition;
+                isPositionCalibrated = true;
+                
+                Debug.Log($"MocopiAvatar: キャリブレーション基準位置設定: {mocopiCalibrationPosition}");
+                Debug.Log($"MocopiAvatar: アバター現在位置: {transform.position}, 初期位置: {avatarInitialPosition}");
+                Debug.Log($"MocopiAvatar: アバター現在回転: {transform.rotation}, 初期回転: {avatarInitialRotation}");
+                Debug.Log($"MocopiAvatar: アバター現在スケール: {transform.localScale}, 初期スケール: {avatarInitialScale}");
+                
+                // アバターを初期状態にリセット
+                ResetToInitialPose();
+                
+                Debug.Log($"MocopiAvatar: 位置キャリブレーション完了 - 基準位置: {mocopiCalibrationPosition}, アバター初期位置: {avatarInitialPosition}");
+            }
+            else
+            {
+                Debug.LogError("MocopiAvatar: ルートボーンが見つからないため、キャリブレーションに失敗しました。");
+            }
+        }
+
+        /// <summary>
+        /// 位置キャリブレーションをリセット
+        /// </summary>
+        public void ResetPositionCalibration()
+        {
+            mocopiCalibrationPosition = Vector3.zero;
+            isPositionCalibrated = false;
+            Debug.Log("MocopiAvatar: 位置キャリブレーションをリセットしました");
+        }
+
+        /// <summary>
+        /// アバターを初期ポーズにリセット
+        /// </summary>
+        /// <summary>
+        /// アバターを初期ポーズにリセット
+        /// </summary>
+        private void ResetToInitialPose()
+        {
+            if (!hasStoredInitialPose)
+            {
+                Debug.LogWarning("MocopiAvatar: 初期ポーズが保存されていません");
+                return;
+            }
+
+            Debug.Log($"MocopiAvatar: 初期ポーズリセット開始");
+            Debug.Log($"MocopiAvatar: リセット前 - 位置: {transform.position}, 回転: {transform.rotation}, スケール: {transform.localScale}");
+
+            // アバターの基本状態をリセット
+            transform.position = avatarInitialPosition;
+            transform.rotation = avatarInitialRotation;
+            transform.localScale = avatarInitialScale;
+
+            Debug.Log($"MocopiAvatar: Transform リセット後 - 位置: {transform.position}, 回転: {transform.rotation}, スケール: {transform.localScale}");
+
+            // 初期HumanPoseを適用してフラットなポーズに戻す
+            if (humanPoseHandlerDst != null)
+            {
+                Debug.Log($"MocopiAvatar: HumanPose適用前 - bodyPosition: {initialHumanPose.bodyPosition}, bodyRotation: {initialHumanPose.bodyRotation}");
+                humanPoseHandlerDst.SetHumanPose(ref initialHumanPose);
+                Debug.Log("MocopiAvatar: 初期HumanPoseを適用しました");
+                
+                // 適用後の状態を確認
+                HumanPose currentPose = new HumanPose();
+                humanPoseHandlerDst.GetHumanPose(ref currentPose);
+                Debug.Log($"MocopiAvatar: HumanPose適用後 - bodyPosition: {currentPose.bodyPosition}, bodyRotation: {currentPose.bodyRotation}");
+            }
+            else
+            {
+                Debug.LogError("MocopiAvatar: humanPoseHandlerDstがnullです");
+            }
+
+            Debug.Log($"MocopiAvatar: アバターを初期ポーズにリセットしました");
+        }
+
+        /// <summary>
+        /// 初期ポーズを保存
+        /// </summary>
+        /// <summary>
+        /// 初期ポーズを保存
+        /// </summary>
+        private void StoreInitialPose()
+        {
+            if (humanPoseHandlerDst != null)
+            {
+                humanPoseHandlerDst.GetHumanPose(ref initialHumanPose);
+                hasStoredInitialPose = true;
+                Debug.Log($"MocopiAvatar: 初期ポーズを保存しました - bodyPosition: {initialHumanPose.bodyPosition}, bodyRotation: {initialHumanPose.bodyRotation}");
+                Debug.Log($"MocopiAvatar: Muscle配列サイズ: {initialHumanPose.muscles?.Length}");
+            }
+            else
+            {
+                Debug.LogError("MocopiAvatar: humanPoseHandlerDstがnullのため、初期ポーズを保存できませんでした");
+            }
+        }
+
+        /// <summary>
+        /// 現在のキャリブレーション状態を取得
+        /// </summary>
+        public bool IsPositionCalibrated => isPositionCalibrated;
+
+        /// <summary>
+        /// 現在のキャリブレーションオフセットを取得
+        /// </summary>
+        public Vector3 GetPositionCalibrationOffset() => mocopiCalibrationPosition;
+
+        /// <summary>
         /// Reset buffer
         /// </summary>
         public void ResetBuffer()
@@ -389,6 +831,14 @@ namespace Mocopi.Receiver
 
             this.Animator = GetComponent<Animator>();
             ResetBuffer();
+            
+            // アバターの初期状態を記録
+            avatarInitialPosition = transform.position;
+            avatarInitialRotation = transform.rotation;
+            avatarInitialScale = transform.localScale;
+            
+            // 高フレームレートで低遅延を実現
+            Application.targetFrameRate = 90;
         }
 
         /// <summary>
@@ -447,6 +897,12 @@ namespace Mocopi.Receiver
 
             if (this.isSkeletonInitialized)
             {
+                // 初期ポーズを一度だけ保存
+                if (!hasStoredInitialPose && humanPoseHandlerDst != null)
+                {
+                    StoreInitialPose();
+                }
+
                 // if the skeleton needs to be updated
                 if (this.isSkeletonUpdated)
                 {
@@ -560,6 +1016,8 @@ namespace Mocopi.Receiver
 
             this.bonePositions.Clear();
             this.boneRotations.Clear();
+            this.initialBonePositions.Clear();
+            this.initialBoneRotations.Clear();
 
             for (int i = 0; i < this.skeletonDefinitionData.BoneIds.Length; i++)
             {
@@ -600,6 +1058,10 @@ namespace Mocopi.Receiver
 
                 this.bonePositions.Add(bone, position);
                 this.boneRotations.Add(bone, rotation);
+                
+                // 初期ボーン状態を保存
+                this.initialBonePositions.Add(bone, position);
+                this.initialBoneRotations.Add(bone, rotation);
             }
 
             foreach (MocopiBone bone in this.bones)
@@ -743,7 +1205,30 @@ namespace Mocopi.Receiver
 
                 if (bone.ParentId < 0)
                 {
-                    this.bonePositions[bone] = position;
+                    // ルートボーンの位置処理
+                    hasReceivedFirstPosition = true;
+                    
+                    if (enablePositionCalibration && isPositionCalibrated)
+                    {
+                        // キャリブレーション有効時：ルートボーンは相対位置のまま（スケールを維持）
+                        this.bonePositions[bone] = Vector3.zero;
+                        
+                        // アバター全体の位置を調整（ただし、HumanPoseの適用に干渉しないよう慎重に）
+                        Vector3 currentMocopiPosition = position;
+                        Vector3 offsetFromCalibration = currentMocopiPosition - mocopiCalibrationPosition;
+                        Vector3 targetPosition = avatarInitialPosition + offsetFromCalibration;
+                        
+                        // 位置の更新頻度を制限して、HumanPoseとの競合を避ける
+                        if (Vector3.Distance(transform.position, targetPosition) > 0.001f)
+                        {
+                            transform.position = targetPosition;
+                        }
+                    }
+                    else
+                    {
+                        // キャリブレーションなしの場合：mocopiの生位置を使用
+                        this.bonePositions[bone] = position;
+                    }
                 }
 
                 this.boneRotations[bone] = rotation;
@@ -934,6 +1419,23 @@ namespace Mocopi.Receiver
                 targetPose = this.poseBuffer[lastBufferIndex].pose;
             }
 
+            // キャリブレーション時は初期ポーズのbodyPositionのみを維持（回転は自由）
+            if (enablePositionCalibration && isPositionCalibrated && hasStoredInitialPose)
+            {
+                targetPose.bodyPosition = initialHumanPose.bodyPosition;
+                // bodyRotationはmocopiデータを使用するためコメントアウト
+                // targetPose.bodyRotation = initialHumanPose.bodyRotation;
+            }
+
+            // 品質ベースのスムージングを適用（品質フィルタが有効な場合）
+            HumanPose finalPose = targetPose;
+            if (enableQualityFilter)
+            {
+                float confidence = GetCurrentFrameConfidence();
+                finalPose = ApplyQualityBasedSmoothing(ref targetPose, confidence);
+            }
+
+            // 従来のMotionSmoothnessスムージングを適用
             if (this.MotionSmoothness > 0)
             {
                 float fps = Application.targetFrameRate > 0 ? Application.targetFrameRate : 60f;
@@ -942,15 +1444,31 @@ namespace Mocopi.Receiver
                 if (lastMotionSmoothness != MotionSmoothness)
                 {
                     lastMotionSmoothness = MotionSmoothness;
-                    smoothnesspose = targetPose;
+                    smoothnesspose = finalPose;
                 }
 
-                LerpHumanPose(ref this.smoothnesspose, ref targetPose, ref this.smoothnesspose, lerpValue);
+                LerpHumanPose(ref this.smoothnesspose, ref finalPose, ref this.smoothnesspose, lerpValue);
+                
+                // キャリブレーション時にbodyPositionのみを強制的に維持（回転は自由）
+                if (enablePositionCalibration && isPositionCalibrated && hasStoredInitialPose)
+                {
+                    smoothnesspose.bodyPosition = initialHumanPose.bodyPosition;
+                    // bodyRotationはmocopiデータを使用するためコメントアウト
+                    // smoothnesspose.bodyRotation = initialHumanPose.bodyRotation;
+                }
+                
                 this.humanPoseHandlerDst.SetHumanPose(ref this.smoothnesspose);
             }
             else
             {
-                this.humanPoseHandlerDst.SetHumanPose(ref targetPose);
+                // MotionSmoothnessが無効の場合でも、品質フィルタが有効なら補正されたポーズを使用
+                this.humanPoseHandlerDst.SetHumanPose(ref finalPose);
+                
+                // smoothnesspose を更新（品質ベースのスムージング用）
+                if (enableQualityFilter)
+                {
+                    smoothnesspose = finalPose;
+                }
             }
         }
 
